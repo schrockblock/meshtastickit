@@ -32,6 +32,10 @@ public actor MeshtasticSession {
     private var drainGeneration: UInt64 = 0
     private var attemptTask: Task<Void, any Error>?
     private var fromNumTask: Task<Void, Never>?
+    /// FIFO slot for ToRadio writes: FCB holds one pending write per characteristic
+    /// and overwrites it, so two in-flight writes would leak the first.
+    private var writeInFlight = false
+    private var writeWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(central: BluetoothCentralClient,
                 clock: any Clock<Duration> = ContinuousClock(),
@@ -82,6 +86,31 @@ public actor MeshtasticSession {
         await tearDownLink()
         guard myEpoch == epoch else { return }
         setState(.disconnected(reason: nil))
+    }
+
+    // MARK: - Send
+
+    /// Writes one DataMessage on `p.portnum`. Returns the packet id whose routing
+    /// result (if the radio sends one) arrives later as `.routing`.
+    public func send(_ p: MeshtasticOutbound) async throws -> UInt32 {
+        guard p.payload.count <= Self.maxPayloadLength else { throw MeshtasticSessionError.payloadTooLarge }
+        guard connectionState == .connected, let radio = radioID else { throw MeshtasticSessionError.notConnected }
+        var id = packetID()
+        if id == 0 { id = 1 }
+        var data = DataMessage()
+        data.portnum = PortNum(rawValue: Int(p.portnum)) ?? .unknownApp
+        data.payload = p.payload
+        var packet = MeshPacket()
+        packet.to = p.to
+        packet.channel = p.channel
+        packet.id = id
+        packet.wantAck = p.wantAck
+        if let hopLimit = p.hopLimit { packet.hopLimit = hopLimit }
+        packet.decoded = data
+        var toRadio = ToRadio()
+        toRadio.packet = packet
+        try await writeToRadio(try toRadio.serializedData(), radio: radio)
+        return id
     }
 
     /// Cancels the current link's tasks and drops its BLE connection. Callers bump
@@ -212,7 +241,26 @@ public actor MeshtasticSession {
     }
 
     private func writeToRadio(_ bytes: Data, radio: UUID) async throws {
+        await acquireWriteSlot()
+        defer { releaseWriteSlot() }
         try await central.writeValue(bytes, radio, MeshGATT.toRadioUUID, .withResponse)
+    }
+
+    private func acquireWriteSlot() async {
+        if writeInFlight {
+            await withCheckedContinuation { writeWaiters.append($0) }
+        } else {
+            writeInFlight = true
+        }
+    }
+
+    /// Hands the slot straight to the next waiter (it stays `writeInFlight`).
+    private func releaseWriteSlot() {
+        if writeWaiters.isEmpty {
+            writeInFlight = false
+        } else {
+            writeWaiters.removeFirst().resume()
+        }
     }
 
     /// Reads FromRadio until config_complete_id == nonce. Empty reads are a
