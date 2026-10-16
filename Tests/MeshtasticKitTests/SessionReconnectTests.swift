@@ -89,6 +89,34 @@ struct SessionBackoffTests {
         return central
     }
 
+    /// connect() superseded by disconnect() while it is still tearing down the
+    /// previous link — before its attempt task ever runs — must still have emitted
+    /// `.connecting` ("always emits .connecting first"; Meshtastified's adapter
+    /// waits for it). The fake parks connect's teardown in `central.disconnect`.
+    @Test func connectSupersededBeforeItsAttemptStillEmitsConnecting() async {
+        let id = UUID()
+        let log = LockIsolated<[String]>([])
+        let disconnectGate = AsyncGate()
+        var central = gatedReadCentral(radio: id, log: log, gate: AsyncGate())
+        central.disconnect = { _ in
+            log.withValue { $0.append("disconnect") }
+            await disconnectGate.wait()
+        }
+        let session = MeshtasticSession(central: central, clock: TestClock())
+        let first = session.events()
+        Task { await session.connect(radio: id) }   // the previous link: held in its handshake
+        let (_, configuring) = await collect(first) { $0 == .connection(.configuring) }
+        #expect(configuring)
+        let after = session.events()                 // replays .configuring
+        Task { await session.connect(radio: id) }   // parks in teardown's central.disconnect
+        let parked = await waitUntil(timeout: .seconds(2)) { log.value.contains("disconnect") }
+        #expect(parked)
+        await session.disconnect()
+        await disconnectGate.open()
+        let (seen, _) = await collect(after, timeout: .milliseconds(300)) { _ in false }
+        #expect(seen.compactMap(\.connectionState) == [.configuring, .connecting, .disconnected(reason: nil)])
+    }
+
     @Test func handshakeTimeoutFailsTheAttemptEvenIfItsReadNeverResolves() async {
         let id = UUID()
         let log = LockIsolated<[String]>([])
@@ -316,7 +344,7 @@ extension CBMBackedTests {
             let h = await makeSessionHarness()
             h.radio.device.answersWantConfig = false
             let armed = LockIsolated(true)
-            h.radio.device.onFromRadioRead = {
+            h.radio.device.onFromRadioRead = { _ in
                 let fire = armed.withValue { isArmed -> Bool in defer { isArmed = false }; return isArmed }
                 if fire { CBMCentralManagerMock.simulatePowerOff() }
             }
@@ -337,6 +365,57 @@ extension CBMBackedTests {
             #expect(reconfigured)
             h.radio.device.onFromRadioRead = nil
             await h.session.disconnect()
+        }
+
+        /// FCB registers a state stream asynchronously and replays the CURRENT state.
+        /// If power goes off after the attempt passed its powered-on gate but before
+        /// the attempt's power watch registered, the watch's first (and only) value is
+        /// `.poweredOff`: it never saw `.poweredOn` itself. The wrapper (live FCB client
+        /// underneath) holds the watch's subscription — the first `state()` call of
+        /// the attempt, made by `runAttempt` before the attempt task runs — until the
+        /// hook has powered off inside the first handshake read. Deterministic.
+        @Test func powerOffBeforeThePowerWatchRegistersStillFailsTheAttempt() async {
+            let radio = await makeMockRadio()
+            let base = radio.central
+            let stateCalls = LockIsolated(0)
+            let watchMayRegister = AsyncGate()
+            var central = base
+            central.state = {
+                let call = stateCalls.withValue { count -> Int in count += 1; return count }
+                guard call == 1 else { return base.state() }
+                return AsyncStream { continuation in
+                    let forward = Task {
+                        await watchMayRegister.wait()
+                        for await state in base.state() { continuation.yield(state) }
+                        continuation.finish()
+                    }
+                    continuation.onTermination = { _ in forward.cancel() }
+                }
+            }
+            let session = MeshtasticSession(central: central)
+            radio.device.answersWantConfig = false
+            let armed = LockIsolated(true)
+            radio.device.onFromRadioRead = { _ in
+                let fire = armed.withValue { isArmed -> Bool in defer { isArmed = false }; return isArmed }
+                guard fire else { return }
+                CBMCentralManagerMock.simulatePowerOff()
+                Task { await watchMayRegister.open() }
+            }
+            let off = session.events()
+            // Unstructured: a session stuck on the leaked read would hang `connect`.
+            Task { await session.connect(radio: radio.id) }
+            let (seenOff, sawReconnecting) = await collect(off) { $0.connectionState == .reconnecting(attempt: 1) }
+            #expect(!armed.value)   // the scenario: powered off with a handshake read pending
+            #expect(seenOff.compactMap(\.connectionState).contains(.configuring))
+            #expect(sawReconnecting)
+
+            radio.device.answersWantConfig = true
+            let on = session.events()
+            CBMCentralManagerMock.simulatePowerOn()
+            let (_, reconfigured) = await collect(on, timeout: .seconds(10)) { $0.isConfigured }
+            #expect(reconfigured)
+            radio.device.onFromRadioRead = nil
+            await session.disconnect()
         }
     }
 }

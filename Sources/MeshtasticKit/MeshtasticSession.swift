@@ -30,6 +30,8 @@ public actor MeshtasticSession {
     /// steady drain racing it on FCB's single read slot per characteristic.
     private var isDraining = false
     private var drainGeneration: UInt64 = 0
+    /// A FromNum notify arrived while the drain lock was held.
+    private var drainRequested = false
     private var attemptTask: Task<Void, any Error>?
     /// The attempt `runAttempt` is waiting on. Its outcome is SESSION-owned: the
     /// attempt task, the handshake timeout, the adapter leaving `.poweredOn`, or
@@ -39,6 +41,8 @@ public actor MeshtasticSession {
     /// throws and it can never emit state or touch BLE again.
     private var attemptSeq: UInt64 = 0
     private var currentAttempt: UInt64 = 0
+    /// The last attempt whose `waitForPoweredOn` returned (see `adapterLeftPoweredOn`).
+    private var attemptPassedPowerGate: UInt64 = 0
     private var attemptOutcome: CheckedContinuation<Result<Void, any Error>, Never>?
     private var fromNumTask: Task<Void, Never>?
     private var disconnectWatchTask: Task<Void, Never>?
@@ -48,7 +52,8 @@ public actor MeshtasticSession {
     /// FIFO slot for ToRadio writes: FCB holds one pending write per characteristic
     /// and overwrites it, so two in-flight writes would leak the first.
     private var writeInFlight = false
-    private var writeWaiters: [CheckedContinuation<Void, any Error>] = []
+    /// Each waiter is resumed with the generation the slot was handed over in.
+    private var writeWaiters: [CheckedContinuation<UInt64, any Error>] = []
     /// Bumped by `resetWriteSlot()` on every link teardown. FCB can leak a pending
     /// write forever (a power-off fails no pending op), so a writer that never
     /// returns must not hold the slot for the next link; a stale writer that does
@@ -90,6 +95,8 @@ public actor MeshtasticSession {
     public func connect(radio: UUID) async {
         epoch &+= 1
         let myEpoch = epoch
+        // Before any await: even a connect superseded at once has emitted it.
+        setState(.connecting)
         await tearDownLink()
         guard myEpoch == epoch else { return }
         radioID = radio
@@ -236,18 +243,23 @@ public actor MeshtasticSession {
             for await state in states {
                 if state == .poweredOn {
                     sawPoweredOn = true
-                } else if sawPoweredOn {
-                    await self?.adapterLeftPoweredOn(attempt: id)
+                } else if await self?.adapterLeftPoweredOn(attempt: id, watchSawPoweredOn: sawPoweredOn) ?? true {
                     return
                 }
             }
         }
     }
 
-    private func adapterLeftPoweredOn(attempt id: UInt64) {
-        guard connectionState == .connecting || connectionState == .configuring else { return }
+    /// FCB registers the watch's state stream asynchronously, so a power-off just
+    /// after `waitForPoweredOn` returned can arrive as the stream's REPLAY — the
+    /// watch then never saw `.poweredOn` itself. The attempt having passed its
+    /// powered-on gate counts as "was powered on". Returns whether the watch is done.
+    private func adapterLeftPoweredOn(attempt id: UInt64, watchSawPoweredOn: Bool) -> Bool {
+        guard watchSawPoweredOn || attemptPassedPowerGate == id else { return false }
+        guard connectionState == .connecting || connectionState == .configuring else { return true }
         logger.error("adapter left poweredOn during a connect attempt")
         abortAttempt(id, AdapterLeftPoweredOn())
+        return true
     }
 
     private func check(_ myEpoch: UInt64, attempt: UInt64) throws {
@@ -258,8 +270,10 @@ public actor MeshtasticSession {
         try check(myEpoch, attempt: attempt)
         myNodeNum = nil
         modemPreset = nil
-        setState(.connecting)
+        // connect() already emitted it for its first attempt; reconnect attempts emit it here.
+        if connectionState != .connecting { setState(.connecting) }
         try await waitForPoweredOn(epoch: myEpoch, attempt: attempt)
+        attemptPassedPowerGate = attempt
         // Subscribe now, so FCB's (asynchronous) registration is done long before
         // the handshake ends; a later subscription could miss an immediate drop.
         let linkEvents = central.events()
@@ -303,6 +317,10 @@ public actor MeshtasticSession {
         setState(.connected)
         emit(.configured(myNodeNum: myNodeNum ?? 0, modemPreset: modemPreset))
         startDisconnectWatch(radio: radio, epoch: myEpoch, events: linkEvents)
+        // The handshake held the drain lock, so a FromNum notify during it was
+        // dropped, and firmware also queues packets heard while no phone was
+        // connected: drain whatever is left after config_complete now.
+        Task { await self.drainSteady(radio: radio, epoch: myEpoch) }
     }
 
     /// CoreBluetooth silently drops commands issued before `.poweredOn`, and
@@ -371,27 +389,32 @@ public actor MeshtasticSession {
     }
 
     /// Returns the generation the slot was acquired in. A queued waiter is either
-    /// handed the slot (same generation, same link) or, on teardown, thrown
-    /// `notConnected` — so a queued send never lands on a newer link, and a queued
-    /// handshake write fails its attempt retryably.
+    /// thrown `notConnected` by teardown, or handed the slot together with the
+    /// generation it was handed in. If a teardown lands between that hand-off and
+    /// the waiter resuming, the generations differ and the waiter throws
+    /// `notConnected` too — its slot was already freed. So a queued write never
+    /// runs unslotted or on a newer link, and a queued handshake write fails its
+    /// attempt retryably.
     private func acquireWriteSlot() async throws -> UInt64 {
-        if writeInFlight {
-            try await withCheckedThrowingContinuation { writeWaiters.append($0) }
-        } else {
+        guard writeInFlight else {
             writeInFlight = true
+            return writeGeneration
         }
-        return writeGeneration
+        let handedIn = try await withCheckedThrowingContinuation { writeWaiters.append($0) }
+        guard handedIn == writeGeneration else { throw MeshtasticSessionError.notConnected }
+        return handedIn
     }
 
-    /// Hands the slot straight to the next waiter (it stays `writeInFlight`). A
-    /// writer from an older generation releases nothing: its slot was already
-    /// freed by `resetWriteSlot()` and may now belong to a newer writer.
+    /// Hands the slot straight to the next waiter (it stays `writeInFlight`),
+    /// stamped with the current generation. A writer from an older generation
+    /// releases nothing: its slot was already freed by `resetWriteSlot()` and may
+    /// now belong to a newer writer.
     private func releaseWriteSlot(_ generation: UInt64) {
         guard generation == writeGeneration else { return }
         if writeWaiters.isEmpty {
             writeInFlight = false
         } else {
-            writeWaiters.removeFirst().resume()
+            writeWaiters.removeFirst().resume(returning: writeGeneration)
         }
     }
 
@@ -451,8 +474,15 @@ public actor MeshtasticSession {
     /// resuming after a newer handshake claimed the lock) exits without emitting
     /// and without releasing the newer claim.
     private func drainSteady(radio: UUID, epoch myEpoch: UInt64) async {
-        guard myEpoch == epoch, !Task.isCancelled, !isDraining else { return }
+        guard myEpoch == epoch, !Task.isCancelled else { return }
+        guard !isDraining else {
+            // Not dropped: the running drain (or the handshake, whose post-configure
+            // drain follows) may already have read past this notify's frame.
+            drainRequested = true
+            return
+        }
         isDraining = true
+        drainRequested = false
         drainGeneration &+= 1
         let claimed = drainGeneration
         defer { if drainGeneration == claimed { isDraining = false } }
@@ -464,8 +494,14 @@ public actor MeshtasticSession {
                 logger.error("FromRadio read failed during drain: \(String(describing: error))")
                 return
             }
-            guard myEpoch == epoch else { return }
-            if data.isEmpty { return }
+            guard myEpoch == epoch, drainGeneration == claimed else { return }
+            if data.isEmpty {
+                // A notify arrived while this drain held the lock: read again before
+                // releasing it, or its frame could sit until the next notify.
+                guard drainRequested else { return }
+                drainRequested = false
+                continue
+            }
             guard let frame = try? FromRadio(serializedBytes: data) else {
                 logger.error("skipping malformed FromRadio frame during drain")
                 continue

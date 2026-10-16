@@ -64,10 +64,11 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
         set { delegate.withState { $0.onPacketWrite = newValue } }
     }
 
-    /// Called synchronously inside each FromRadio read request, BEFORE the next
-    /// queued frame is taken and before CoreBluetoothMock schedules the response.
-    /// Lets a test act while the client's read is still pending.
-    public var onFromRadioRead: (@Sendable () -> Void)? {
+    /// Called synchronously inside each FromRadio read request with the bytes it
+    /// serves (empty when the queue is empty), AFTER they are taken from the queue
+    /// and BEFORE CoreBluetoothMock schedules the response. Lets a test act while
+    /// the client's read is still pending — e.g. queue a frame the read missed.
+    public var onFromRadioRead: (@Sendable (_ served: Data) -> Void)? {
         get { delegate.withState { $0.onFromRadioRead } }
         set { delegate.withState { $0.onFromRadioRead = newValue } }
     }
@@ -191,7 +192,7 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             var ackBehavior: AckBehavior = .ack
             var answersWantConfig = true
             var onPacketWrite: (@Sendable (MeshPacket) -> Void)?
-            var onFromRadioRead: (@Sendable () -> Void)?
+            var onFromRadioRead: (@Sendable (_ served: Data) -> Void)?
             var receivedPackets: [MeshPacket] = []
         }
 
@@ -354,8 +355,8 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             guard characteristic.uuid.uuidString == MeshGATT.fromRadioUUID.uuidString else {
                 return .success(Data())
             }
-            withState { $0.onFromRadioRead }?()
             let next = withState { s in s.queue.isEmpty ? Data() : s.queue.removeFirst() }
+            withState { $0.onFromRadioRead }?(next)
             return .success(next)
         }
 
