@@ -290,8 +290,23 @@ public actor MeshtasticSession {
             if case .lora(let lora)? = config.payloadVariant {
                 modemPreset = lora.modemPreset.rawValue
             }
+        case .packet(let packet)?:
+            emitPacketEvents(packet)
         default:
             break
+        }
+    }
+
+    /// `.packet` for any decoded port; encrypted packets (no `.decoded`) are not
+    /// emitted. A negative wire portnum (`PortNum.UNRECOGNIZED(-1)`) is dropped —
+    /// `UInt32(_:)` would trap on it. ROUTING_APP also yields `.routing`.
+    private func emitPacketEvents(_ packet: MeshPacket) {
+        guard case .decoded(let data)? = packet.payloadVariant,
+              let portnum = UInt32(exactly: data.portnum.rawValue) else { return }
+        emit(.packet(from: packet.from, to: packet.to, channel: packet.channel,
+                     portnum: portnum, payload: data.payload, id: packet.id))
+        if data.portnum == .routingApp, let routing = try? Routing(serializedBytes: data.payload) {
+            emit(.routing(packetID: data.requestID, ok: routing.errorReason == .none))
         }
     }
 }
