@@ -64,6 +64,14 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
         set { delegate.withState { $0.onPacketWrite = newValue } }
     }
 
+    /// Called synchronously inside each FromRadio read request, BEFORE the next
+    /// queued frame is taken and before CoreBluetoothMock schedules the response.
+    /// Lets a test act while the client's read is still pending.
+    public var onFromRadioRead: (@Sendable () -> Void)? {
+        get { delegate.withState { $0.onFromRadioRead } }
+        set { delegate.withState { $0.onFromRadioRead = newValue } }
+    }
+
     /// Every decoded MeshPacket written to ToRadio, in arrival order.
     public var receivedPackets: [MeshPacket] { delegate.withState { $0.receivedPackets } }
 
@@ -183,6 +191,7 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             var ackBehavior: AckBehavior = .ack
             var answersWantConfig = true
             var onPacketWrite: (@Sendable (MeshPacket) -> Void)?
+            var onFromRadioRead: (@Sendable () -> Void)?
             var receivedPackets: [MeshPacket] = []
         }
 
@@ -345,6 +354,7 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             guard characteristic.uuid.uuidString == MeshGATT.fromRadioUUID.uuidString else {
                 return .success(Data())
             }
+            withState { $0.onFromRadioRead }?()
             let next = withState { s in s.queue.isEmpty ? Data() : s.queue.removeFirst() }
             return .success(next)
         }

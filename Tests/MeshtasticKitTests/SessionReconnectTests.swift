@@ -74,6 +74,84 @@ struct SessionBackoffTests {
         let (seen, _) = await collect(after, timeout: .milliseconds(500)) { _ in false }
         #expect(seen.compactMap(\.connectionState) == [.disconnected(reason: nil)])
     }
+
+    /// A fake whose FromRadio read suspends until `gate` opens, ignoring
+    /// cancellation and disconnect — FCB's behaviour for a read pending at a
+    /// power-off (its disconnect of a `.disconnected` peripheral is a no-op). CBM
+    /// cannot hold a read of a CONNECTED peripheral open, hence the fake.
+    private func gatedReadCentral(radio: UUID, log: LockIsolated<[String]>, gate: AsyncGate,
+                                  lateFrame: Data = Data()) -> BluetoothCentralClient {
+        var central = fakeCentral(radio: radio, log: log, connect: {})
+        central.readValue = { _, _ in
+            await gate.wait()
+            return lateFrame
+        }
+        return central
+    }
+
+    @Test func handshakeTimeoutFailsTheAttemptEvenIfItsReadNeverResolves() async {
+        let id = UUID()
+        let log = LockIsolated<[String]>([])
+        let clock = TestClock()
+        let session = MeshtasticSession(central: gatedReadCentral(radio: id, log: log, gate: AsyncGate()), clock: clock)
+        let events = session.events()
+        // Unstructured and never awaited: a session waiting on the read would hang `connect`.
+        Task { await session.connect(radio: id) }
+        let (_, configuring) = await collect(events) { $0 == .connection(.configuring) }
+        #expect(configuring)
+        try? await Task.sleep(for: .milliseconds(100))   // let the timeout's sleep register on the TestClock
+        let after = session.events()
+        await clock.advance(by: .seconds(30))
+        let (_, backedOff) = await collect(after) { $0 == .connection(.reconnecting(attempt: 1)) }
+        #expect(backedOff)
+        await session.disconnect()
+    }
+
+    @Test func disconnectEndsAConnectStuckInItsHandshake() async {
+        let id = UUID()
+        let log = LockIsolated<[String]>([])
+        let session = MeshtasticSession(central: gatedReadCentral(radio: id, log: log, gate: AsyncGate()), clock: TestClock())
+        let events = session.events()
+        let returned = LockIsolated(false)
+        Task {
+            await session.connect(radio: id)
+            returned.setValue(true)
+        }
+        let (_, configuring) = await collect(events) { $0 == .connection(.configuring) }
+        #expect(configuring)
+        let after = session.events()
+        await session.disconnect()
+        let connectReturned = await waitUntil(timeout: .seconds(2)) { returned.value }
+        #expect(connectReturned)
+        let (seen, _) = await collect(after, timeout: .milliseconds(300)) { _ in false }
+        #expect(seen.compactMap(\.connectionState) == [.configuring, .disconnected(reason: nil)])
+    }
+
+    @Test func abandonedHandshakeResolvingLateCannotResurrectTheLink() async throws {
+        let id = UUID()
+        let log = LockIsolated<[String]>([])
+        let clock = TestClock()   // never advanced past the timeout: the loop stays in its first backoff sleep
+        let gate = AsyncGate()
+        var complete = FromRadio()
+        complete.configCompleteID = 7
+        let central = gatedReadCentral(radio: id, log: log, gate: gate, lateFrame: try complete.serializedData())
+        let session = MeshtasticSession(central: central, clock: clock, packetID: { 7 })
+        let events = session.events()
+        Task { await session.connect(radio: id) }
+        let (_, configuring) = await collect(events) { $0 == .connection(.configuring) }
+        #expect(configuring)
+        try? await Task.sleep(for: .milliseconds(100))
+        let aborted = session.events()
+        await clock.advance(by: .seconds(30))
+        let (_, backedOff) = await collect(aborted) { $0 == .connection(.reconnecting(attempt: 1)) }
+        #expect(backedOff)
+        // The abandoned handshake's read now returns a matching config_complete.
+        let late = session.events()
+        await gate.open()
+        let (seen, _) = await collect(late, timeout: .milliseconds(500)) { _ in false }
+        #expect(seen == [.connection(.reconnecting(attempt: 1))])
+        await session.disconnect()
+    }
 }
 
 extension CBMBackedTests {
@@ -182,6 +260,41 @@ extension CBMBackedTests {
             #expect(backedOff)
             await h.session.disconnect()   // first: also ends a handshake that never timed out
             await connecting.value
+        }
+
+        /// Power-off DURING the want_config handshake: no didDisconnect, FCB fails
+        /// no pending op, and a disconnect of the already-`.disconnected` peripheral
+        /// is a no-op — so the handshake's FromRadio read never resolves. The hook
+        /// powers off INSIDE the first FromRadio read request (the radio ignores
+        /// want_config, so the session is deterministically `.configuring` with that
+        /// read pending). The session itself must fail the attempt, back off, and
+        /// configure again once power returns. Real clock: 1 s + 2 s of backoff
+        /// (the first post-power-on handshake read hits FCB's stale pending read).
+        @Test func powerOffDuringHandshakeFailsTheAttemptAndReconnects() async {
+            let h = await makeSessionHarness()
+            h.radio.device.answersWantConfig = false
+            let armed = LockIsolated(true)
+            h.radio.device.onFromRadioRead = {
+                let fire = armed.withValue { isArmed -> Bool in defer { isArmed = false }; return isArmed }
+                if fire { CBMCentralManagerMock.simulatePowerOff() }
+            }
+            let off = h.session.events()
+            // Unstructured: a session stuck on the leaked read would hang `connect`.
+            Task { [session = h.session, id = h.radio.id] in await session.connect(radio: id) }
+            let (seenOff, sawUnavailable) = await collect(off) { $0.isAdapterUnavailable }
+            #expect(!armed.value)   // the scenario: powered off with a handshake read pending
+            #expect(sawUnavailable)
+            #expect(seenOff.compactMap(\.connectionState).contains(.configuring))
+            #expect(seenOff.contains { $0.connectionState == .reconnecting(attempt: 1) })
+            #expect(!seenOff.contains { $0.isConfigured })
+
+            h.radio.device.answersWantConfig = true
+            let on = h.session.events()
+            CBMCentralManagerMock.simulatePowerOn()
+            let (_, reconfigured) = await collect(on, timeout: .seconds(10)) { $0.isConfigured }
+            #expect(reconfigured)
+            h.radio.device.onFromRadioRead = nil
+            await h.session.disconnect()
         }
     }
 }

@@ -31,6 +31,15 @@ public actor MeshtasticSession {
     private var isDraining = false
     private var drainGeneration: UInt64 = 0
     private var attemptTask: Task<Void, any Error>?
+    /// The attempt `runAttempt` is waiting on. Its outcome is SESSION-owned: the
+    /// attempt task, the handshake timeout, the adapter leaving `.poweredOn`, or
+    /// teardown — whichever comes first — resolves it. FCB fails no pending op on a
+    /// power-off, so an attempt must never depend on FCB to end. An attempt that
+    /// lost the race is abandoned: its id no longer matches, so every `check` in it
+    /// throws and it can never emit state or touch BLE again.
+    private var attemptSeq: UInt64 = 0
+    private var currentAttempt: UInt64 = 0
+    private var attemptOutcome: CheckedContinuation<Result<Void, any Error>, Never>?
     private var fromNumTask: Task<Void, Never>?
     private var disconnectWatchTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
@@ -132,6 +141,9 @@ public actor MeshtasticSession {
         reconnectTask = nil
         disconnectWatchTask?.cancel()
         disconnectWatchTask = nil
+        // A stuck attempt (an FCB op that never resolves) would otherwise keep
+        // connect() suspended forever: resolve it as superseded.
+        abortAttempt(nil, CancellationError())
         attemptTask?.cancel()
         attemptTask = nil
         fromNumTask?.cancel()
@@ -151,12 +163,30 @@ public actor MeshtasticSession {
         let reason: String
     }
 
+    /// The handshake got no config_complete within `handshakeTimeout`.
+    private struct HandshakeTimedOut: Error {}
+    /// The adapter left `.poweredOn` mid-attempt (iOS reports a power-off as a
+    /// state change only, and FCB fails no pending op on it).
+    private struct AdapterLeftPoweredOn: Error {}
+
     /// Runs one attempt in its own task, so `disconnect()` can cancel the parts
-    /// that do honor cancellation (the powered-on wait).
+    /// that do honor cancellation (the powered-on wait), and waits on the
+    /// session-owned outcome rather than on the task itself.
     private func runAttempt(radio: UUID, epoch myEpoch: UInt64) async -> AttemptOutcome {
-        let task = Task { try await self.attemptConnect(radio: radio, epoch: myEpoch) }
+        attemptSeq &+= 1
+        let id = attemptSeq
+        currentAttempt = id
+        let task = Task { try await self.attemptConnect(radio: radio, epoch: myEpoch, attempt: id) }
         attemptTask = task
-        let result = await task.result
+        let powerWatch = startAttemptPowerWatch(attempt: id)
+        let result: Result<Void, any Error> = await withCheckedContinuation { outcome in
+            attemptOutcome = outcome
+            Task {   // actor-isolated: resolves on the session
+                let finished = await task.result
+                self.resolveAttempt(id, finished)
+            }
+        }
+        powerWatch.cancel()
         if attemptTask == task { attemptTask = nil }
         switch result {
         case .success:
@@ -172,16 +202,58 @@ public actor MeshtasticSession {
         }
     }
 
-    private func check(_ myEpoch: UInt64) throws {
-        if myEpoch != epoch || Task.isCancelled { throw CancellationError() }
+    /// The attempt task finished (either way). Ignored if the attempt was already
+    /// resolved by a timeout, a power-off or teardown.
+    private func resolveAttempt(_ id: UInt64, _ result: Result<Void, any Error>) {
+        guard id == currentAttempt, let outcome = attemptOutcome else { return }
+        attemptOutcome = nil
+        outcome.resume(returning: result)
     }
 
-    private func attemptConnect(radio: UUID, epoch myEpoch: UInt64) async throws {
-        try check(myEpoch)
+    /// Fails attempt `id` (any current attempt when nil) now, abandoning whatever
+    /// FCB call it is suspended in.
+    private func abortAttempt(_ id: UInt64?, _ error: any Error) {
+        guard let outcome = attemptOutcome, id == nil || id == currentAttempt else { return }
+        attemptOutcome = nil
+        currentAttempt = 0
+        attemptTask?.cancel()
+        outcome.resume(returning: .failure(error))
+    }
+
+    /// Watches the adapter for the whole attempt: once it has been `.poweredOn`,
+    /// leaving that state while still `.connecting`/`.configuring` fails the
+    /// attempt (retryably). After `.configured` the disconnect watch takes over.
+    private func startAttemptPowerWatch(attempt id: UInt64) -> Task<Void, Never> {
+        let states = central.state()
+        return Task { [weak self] in
+            var sawPoweredOn = false
+            for await state in states {
+                if state == .poweredOn {
+                    sawPoweredOn = true
+                } else if sawPoweredOn {
+                    await self?.adapterLeftPoweredOn(attempt: id)
+                    return
+                }
+            }
+        }
+    }
+
+    private func adapterLeftPoweredOn(attempt id: UInt64) {
+        guard connectionState == .connecting || connectionState == .configuring else { return }
+        logger.error("adapter left poweredOn during a connect attempt")
+        abortAttempt(id, AdapterLeftPoweredOn())
+    }
+
+    private func check(_ myEpoch: UInt64, attempt: UInt64) throws {
+        if myEpoch != epoch || attempt != currentAttempt || Task.isCancelled { throw CancellationError() }
+    }
+
+    private func attemptConnect(radio: UUID, epoch myEpoch: UInt64, attempt: UInt64) async throws {
+        try check(myEpoch, attempt: attempt)
         myNodeNum = nil
         modemPreset = nil
         setState(.connecting)
-        try await waitForPoweredOn(epoch: myEpoch)
+        try await waitForPoweredOn(epoch: myEpoch, attempt: attempt)
         // Subscribe now, so FCB's (asynchronous) registration is done long before
         // the handshake ends; a later subscription could miss an immediate drop.
         let linkEvents = central.events()
@@ -189,34 +261,34 @@ public actor MeshtasticSession {
         // re-stores the live peripheral object in FCB, replacing one CoreBluetooth invalidated
         // in a power cycle (FCB BluetoothCentralClient+Live.swift:271-275).
         let known = await central.retrievePeripherals([radio])
-        try check(myEpoch)
+        try check(myEpoch, attempt: attempt)
         guard known.contains(where: { $0.id == radio }) else {
             throw TerminalFailure(reason: "radio not found")
         }
         _ = try await central.connect(radio, ConnectOptions?.none)
-        try check(myEpoch)
+        try check(myEpoch, attempt: attempt)
         _ = try await central.discoverServices(radio, [MeshGATT.serviceUUID])
-        try check(myEpoch)
+        try check(myEpoch, attempt: attempt)
         _ = try await central.discoverCharacteristics(
             radio, MeshGATT.serviceUUID,
             [MeshGATT.toRadioUUID, MeshGATT.fromRadioUUID, MeshGATT.fromNumUUID]
         )
-        try check(myEpoch)
+        try check(myEpoch, attempt: attempt)
         // Subscribe to FromNum BEFORE want_config so no notify is lost.
         try await central.setNotify(true, radio, MeshGATT.fromNumUUID)
-        try check(myEpoch)
+        try check(myEpoch, attempt: attempt)
         startFromNumLoop(radio: radio, epoch: myEpoch)
 
         isDraining = true
         drainGeneration &+= 1
         let claimed = drainGeneration
         setState(.configuring)
-        let timeout = startHandshakeTimeout(radio: radio, epoch: myEpoch, generation: claimed)
+        let timeout = startHandshakeTimeout(epoch: myEpoch, attempt: attempt)
         defer { timeout.cancel() }
         do {
             try await requestConfig(radio: radio)
-            try await drainUntilConfigComplete(radio: radio, epoch: myEpoch)
-            try check(myEpoch)
+            try await drainUntilConfigComplete(radio: radio, epoch: myEpoch, attempt: attempt)
+            try check(myEpoch, attempt: attempt)
         } catch {
             if drainGeneration == claimed { isDraining = false }
             throw error
@@ -230,10 +302,10 @@ public actor MeshtasticSession {
     /// CoreBluetooth silently drops commands issued before `.poweredOn`, and
     /// `retrievePeripherals` returns [] until then — so wait. FCB's state stream
     /// replays the current state, so this returns at once when already on.
-    private func waitForPoweredOn(epoch myEpoch: UInt64) async throws {
+    private func waitForPoweredOn(epoch myEpoch: UInt64, attempt: UInt64) async throws {
         var reportedOff = false
         for await state in central.state() {
-            try check(myEpoch)
+            try check(myEpoch, attempt: attempt)
             switch state {
             case .poweredOn:
                 return
@@ -307,10 +379,10 @@ public actor MeshtasticSession {
 
     /// Reads FromRadio until config_complete_id == nonce. Empty reads are a
     /// transient gap during the handshake and are retried; malformed frames skipped.
-    private func drainUntilConfigComplete(radio: UUID, epoch myEpoch: UInt64) async throws {
+    private func drainUntilConfigComplete(radio: UUID, epoch myEpoch: UInt64, attempt: UInt64) async throws {
         while true {
             let data = try await central.readValue(radio, MeshGATT.fromRadioUUID)
-            try check(myEpoch)
+            try check(myEpoch, attempt: attempt)
             if data.isEmpty { continue }
             guard let frame = try? FromRadio(serializedBytes: data) else {
                 logger.error("skipping malformed FromRadio frame during handshake")
@@ -470,12 +542,13 @@ public actor MeshtasticSession {
         }
     }
 
-    /// No config_complete within `handshakeTimeout` on the injected clock → drop the
-    /// BLE link. The handshake's pending read then fails (FCB fails pending ops on
-    /// didDisconnect), the attempt fails retryable, and the caller enters backoff —
-    /// the same path as a lost link. Cancelled by `attemptConnect`'s defer when the
-    /// handshake ends either way.
-    private func startHandshakeTimeout(radio: UUID, epoch myEpoch: UInt64, generation: UInt64) -> Task<Void, Never> {
+    /// No config_complete within `handshakeTimeout` on the injected clock → the
+    /// session fails the attempt itself (retryably), abandoning the handshake's
+    /// pending FCB read; `runAttempt`'s failure path then drops the BLE link and
+    /// the caller enters backoff — the same path as a lost link. It must not wait
+    /// for FCB: after a power-off FCB's disconnect is a no-op and nothing fails the
+    /// read. Cancelled by `attemptConnect`'s defer when the handshake ends.
+    private func startHandshakeTimeout(epoch myEpoch: UInt64, attempt: UInt64) -> Task<Void, Never> {
         let clock = self.clock
         return Task { [weak self] in
             do {
@@ -483,13 +556,13 @@ public actor MeshtasticSession {
             } catch {
                 return
             }
-            await self?.handshakeTimedOut(radio: radio, epoch: myEpoch, generation: generation)
+            await self?.handshakeTimedOut(epoch: myEpoch, attempt: attempt)
         }
     }
 
-    private func handshakeTimedOut(radio: UUID, epoch myEpoch: UInt64, generation: UInt64) async {
-        guard myEpoch == epoch, connectionState == .configuring, drainGeneration == generation else { return }
+    private func handshakeTimedOut(epoch myEpoch: UInt64, attempt: UInt64) {
+        guard myEpoch == epoch, connectionState == .configuring else { return }
         logger.error("want_config handshake timed out")
-        try? await central.disconnect(radio)
+        abortAttempt(attempt, HandshakeTimedOut())
     }
 }
