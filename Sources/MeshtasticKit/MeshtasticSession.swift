@@ -39,7 +39,12 @@ public actor MeshtasticSession {
     /// FIFO slot for ToRadio writes: FCB holds one pending write per characteristic
     /// and overwrites it, so two in-flight writes would leak the first.
     private var writeInFlight = false
-    private var writeWaiters: [CheckedContinuation<Void, Never>] = []
+    private var writeWaiters: [CheckedContinuation<Void, any Error>] = []
+    /// Bumped by `resetWriteSlot()` on every link teardown. FCB can leak a pending
+    /// write forever (a power-off fails no pending op), so a writer that never
+    /// returns must not hold the slot for the next link; a stale writer that does
+    /// return releases nothing.
+    private var writeGeneration: UInt64 = 0
 
     public init(central: BluetoothCentralClient,
                 clock: any Clock<Duration> = ContinuousClock(),
@@ -131,6 +136,7 @@ public actor MeshtasticSession {
         attemptTask = nil
         fromNumTask?.cancel()
         fromNumTask = nil
+        resetWriteSlot()
         let old = radioID
         radioID = nil
         if let old { try? await central.disconnect(old) }
@@ -160,6 +166,7 @@ public actor MeshtasticSession {
             if let terminal = error as? TerminalFailure { return .terminal(terminal.reason) }
             fromNumTask?.cancel()
             fromNumTask = nil
+            resetWriteSlot()
             try? await central.disconnect(radio)
             return myEpoch == epoch ? .retryable(String(describing: error)) : .superseded
         }
@@ -258,26 +265,44 @@ public actor MeshtasticSession {
     }
 
     private func writeToRadio(_ bytes: Data, radio: UUID) async throws {
-        await acquireWriteSlot()
-        defer { releaseWriteSlot() }
+        let generation = try await acquireWriteSlot()
+        defer { releaseWriteSlot(generation) }
         try await central.writeValue(bytes, radio, MeshGATT.toRadioUUID, .withResponse)
     }
 
-    private func acquireWriteSlot() async {
+    /// Returns the generation the slot was acquired in. A queued waiter is either
+    /// handed the slot (same generation, same link) or, on teardown, thrown
+    /// `notConnected` — so a queued send never lands on a newer link, and a queued
+    /// handshake write fails its attempt retryably.
+    private func acquireWriteSlot() async throws -> UInt64 {
         if writeInFlight {
-            await withCheckedContinuation { writeWaiters.append($0) }
+            try await withCheckedThrowingContinuation { writeWaiters.append($0) }
         } else {
             writeInFlight = true
         }
+        return writeGeneration
     }
 
-    /// Hands the slot straight to the next waiter (it stays `writeInFlight`).
-    private func releaseWriteSlot() {
+    /// Hands the slot straight to the next waiter (it stays `writeInFlight`). A
+    /// writer from an older generation releases nothing: its slot was already
+    /// freed by `resetWriteSlot()` and may now belong to a newer writer.
+    private func releaseWriteSlot(_ generation: UInt64) {
+        guard generation == writeGeneration else { return }
         if writeWaiters.isEmpty {
             writeInFlight = false
         } else {
             writeWaiters.removeFirst().resume()
         }
+    }
+
+    /// Link teardown: abandon the in-flight write (FCB may never resume it), free
+    /// the slot, and fail every queued writer.
+    private func resetWriteSlot() {
+        writeGeneration &+= 1
+        writeInFlight = false
+        let waiters = writeWaiters
+        writeWaiters = []
+        for waiter in waiters { waiter.resume(throwing: MeshtasticSessionError.notConnected) }
     }
 
     /// Reads FromRadio until config_complete_id == nonce. Empty reads are a
@@ -402,6 +427,9 @@ public actor MeshtasticSession {
         disconnectWatchTask = nil
         fromNumTask?.cancel()
         fromNumTask = nil
+        // A power-off fails no FCB op and sends no didDisconnect: a write in
+        // flight now never returns. Do not let it hold the slot for the next link.
+        resetWriteSlot()
         scheduleReconnect(radio: radio, epoch: myEpoch)
     }
 

@@ -55,6 +55,15 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
         set { delegate.withState { $0.answersWantConfig = newValue } }
     }
 
+    /// Called synchronously inside each ToRadio packet write request, after the
+    /// packet is recorded and BEFORE CoreBluetoothMock schedules the write response.
+    /// Lets a test act while the client's write is still pending (e.g. power off,
+    /// so the response is never delivered).
+    public var onPacketWrite: (@Sendable (MeshPacket) -> Void)? {
+        get { delegate.withState { $0.onPacketWrite } }
+        set { delegate.withState { $0.onPacketWrite = newValue } }
+    }
+
     /// Every decoded MeshPacket written to ToRadio, in arrival order.
     public var receivedPackets: [MeshPacket] { delegate.withState { $0.receivedPackets } }
 
@@ -173,6 +182,7 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             var modemPreset: Config.LoRaConfig.ModemPreset?
             var ackBehavior: AckBehavior = .ack
             var answersWantConfig = true
+            var onPacketWrite: (@Sendable (MeshPacket) -> Void)?
             var receivedPackets: [MeshPacket] = []
         }
 
@@ -361,10 +371,11 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
                 pushFromNum()
             case .packet(let sent)?:
                 guard case .decoded(let sentData)? = sent.payloadVariant else { return .success(()) }
-                let behavior = withState { s -> AckBehavior in
+                let (behavior, hook) = withState { s -> (AckBehavior, (@Sendable (MeshPacket) -> Void)?) in
                     s.receivedPackets.append(sent)
-                    return s.ackBehavior
+                    return (s.ackBehavior, s.onPacketWrite)
                 }
+                hook?(sent)
                 if let reply = routingReply(to: sent, behavior: behavior) {
                     enqueue(reply)
                     pushFromNum()

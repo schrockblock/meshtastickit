@@ -112,5 +112,49 @@ extension CBMBackedTests {
             #expect(Set(results.value).count == 5)
             #expect(h.radio.device.receivedPackets.count == 5)
         }
+
+        /// Power-off while FCB's write is pending: CBM drops the write response
+        /// (CBMCentralManagerMock.swift:1477-1478 only responds while `.connected`) and
+        /// FCB fails no pending op on a state change, so that send never returns.
+        /// The hook powers off INSIDE the write request, before the response is
+        /// scheduled — deterministic. The session must not let the leaked write hold
+        /// the write slot: the next link's want_config and a later send need it.
+        @Test func powerOffDuringASendFreesTheWriteSlotForTheNextLink() async {
+            let h = await makeSessionHarness()
+            h.radio.device.ackBehavior = .silent
+            await h.session.connect(radio: h.radio.id)
+            let armed = LockIsolated(true)
+            h.radio.device.onPacketWrite = { _ in
+                let fire = armed.withValue { isArmed -> Bool in defer { isArmed = false }; return isArmed }
+                if fire { CBMCentralManagerMock.simulatePowerOff() }
+            }
+            let off = h.session.events()
+            let stuckFinished = LockIsolated(false)
+            let stuck = Task { [session = h.session] in
+                _ = try? await session.send(MeshtasticOutbound(portnum: 76, payload: Data([1])))
+                stuckFinished.setValue(true)
+            }
+            let (_, sawReconnecting) = await collect(off) { $0.connectionState == .reconnecting(attempt: 1) }
+            #expect(sawReconnecting)
+            #expect(h.radio.device.receivedPackets.count == 1)
+            #expect(!stuckFinished.value)   // the scenario: that write is still pending in FCB
+
+            let on = h.session.events()
+            CBMCentralManagerMock.simulatePowerOn()
+            let (_, reconfigured) = await collect(on, timeout: .seconds(10)) { $0.isConfigured }
+            #expect(reconfigured)
+
+            // Unstructured + polling so a hung send fails this test instead of hanging it.
+            let nextID = LockIsolated<UInt32?>(nil)
+            Task { [session = h.session] in
+                let id = try? await session.send(MeshtasticOutbound(portnum: 76, payload: Data([2])))
+                nextID.setValue(id)
+            }
+            let sent = await waitUntil(timeout: .seconds(5)) { nextID.value != nil }
+            #expect(sent)
+            #expect(h.radio.device.receivedPackets.count == 2)
+            stuck.cancel()
+            await h.session.disconnect()
+        }
     }
 }
