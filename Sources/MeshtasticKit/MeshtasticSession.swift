@@ -32,6 +32,10 @@ public actor MeshtasticSession {
     private var drainGeneration: UInt64 = 0
     private var attemptTask: Task<Void, any Error>?
     private var fromNumTask: Task<Void, Never>?
+    private var disconnectWatchTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    static let maxBackoff: Duration = .seconds(30)
+    static let handshakeTimeout: Duration = .seconds(30)
     /// FIFO slot for ToRadio writes: FCB holds one pending write per characteristic
     /// and overwrites it, so two in-flight writes would leak the first.
     private var writeInFlight = false
@@ -74,9 +78,12 @@ public actor MeshtasticSession {
         switch outcome {
         case .connected, .superseded:
             return
-        case .terminal(let reason), .retryable(let reason):
+        case .terminal(let reason):
             radioID = nil
             setState(.disconnected(reason: reason))
+        case .retryable(let reason):
+            logger.error("connect attempt failed: \(reason)")
+            scheduleReconnect(radio: radio, epoch: myEpoch)
         }
     }
 
@@ -116,6 +123,10 @@ public actor MeshtasticSession {
     /// Cancels the current link's tasks and drops its BLE connection. Callers bump
     /// `epoch` first, so nothing cancelled here can emit afterwards.
     private func tearDownLink() async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        disconnectWatchTask?.cancel()
+        disconnectWatchTask = nil
         attemptTask?.cancel()
         attemptTask = nil
         fromNumTask?.cancel()
@@ -164,6 +175,9 @@ public actor MeshtasticSession {
         modemPreset = nil
         setState(.connecting)
         try await waitForPoweredOn(epoch: myEpoch)
+        // Subscribe now, so FCB's (asynchronous) registration is done long before
+        // the handshake ends; a later subscription could miss an immediate drop.
+        let linkEvents = central.events()
         // retrievePeripherals (not scan) is the only way this session finds a radio. It also
         // re-stores the live peripheral object in FCB, replacing one CoreBluetooth invalidated
         // in a power cycle (FCB BluetoothCentralClient+Live.swift:271-275).
@@ -190,6 +204,8 @@ public actor MeshtasticSession {
         drainGeneration &+= 1
         let claimed = drainGeneration
         setState(.configuring)
+        let timeout = startHandshakeTimeout(radio: radio, epoch: myEpoch, generation: claimed)
+        defer { timeout.cancel() }
         do {
             try await requestConfig(radio: radio)
             try await drainUntilConfigComplete(radio: radio, epoch: myEpoch)
@@ -201,6 +217,7 @@ public actor MeshtasticSession {
         isDraining = false
         setState(.connected)
         emit(.configured(myNodeNum: myNodeNum ?? 0, modemPreset: modemPreset))
+        startDisconnectWatch(radio: radio, epoch: myEpoch, events: linkEvents)
     }
 
     /// CoreBluetooth silently drops commands issued before `.poweredOn`, and
@@ -356,5 +373,95 @@ public actor MeshtasticSession {
         if data.portnum == .routingApp, let routing = try? Routing(serializedBytes: data.payload) {
             emit(.routing(packetID: data.requestID, ok: routing.errorReason == .none))
         }
+    }
+
+    // MARK: - Reconnect
+
+    /// FCB's `events()` is process-global: only THIS radio's didDisconnect counts.
+    /// A non-poweredOn state counts too — iOS sends no didDisconnect on power-off.
+    private func startDisconnectWatch(radio: UUID, epoch myEpoch: UInt64, events: AsyncStream<CentralEvent>) {
+        disconnectWatchTask?.cancel()
+        disconnectWatchTask = Task { [weak self] in
+            for await event in events {
+                switch event {
+                case .didDisconnect(let peripheral, _) where peripheral.id == radio:
+                    await self?.handleLinkLost(radio: radio, epoch: myEpoch)
+                    return
+                case .didUpdateState(let state) where state != .poweredOn:
+                    await self?.handleLinkLost(radio: radio, epoch: myEpoch)
+                    return
+                default:
+                    continue
+                }
+            }
+        }
+    }
+
+    private func handleLinkLost(radio: UUID, epoch myEpoch: UInt64) {
+        guard myEpoch == epoch, connectionState == .connected else { return }
+        disconnectWatchTask = nil
+        fromNumTask?.cancel()
+        fromNumTask = nil
+        scheduleReconnect(radio: radio, epoch: myEpoch)
+    }
+
+    private func scheduleReconnect(radio: UUID, epoch myEpoch: UInt64) {
+        setState(.reconnecting(attempt: 1))
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            await self?.reconnectLoop(radio: radio, epoch: myEpoch)
+        }
+    }
+
+    /// Capped exponential backoff — 1 s, 2 s, 4 s, 8 s, 16 s, then 30 s forever —
+    /// on the injected clock, until an attempt connects, a terminal cause appears,
+    /// or connect/disconnect bumps the epoch. Never scans: attempts retrieve.
+    private func reconnectLoop(radio: UUID, epoch myEpoch: UInt64) async {
+        var delay: Duration = .seconds(1)
+        var attempt = 1
+        while myEpoch == epoch {
+            do {
+                try await clock.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard myEpoch == epoch else { return }
+            switch await runAttempt(radio: radio, epoch: myEpoch) {
+            case .connected, .superseded:
+                return
+            case .terminal(let reason):
+                radioID = nil
+                setState(.disconnected(reason: reason))
+                return
+            case .retryable(let reason):
+                logger.error("reconnect attempt \(attempt) failed: \(reason)")
+                delay = min(delay * 2, Self.maxBackoff)
+                attempt += 1
+                setState(.reconnecting(attempt: attempt))
+            }
+        }
+    }
+
+    /// No config_complete within `handshakeTimeout` on the injected clock → drop the
+    /// BLE link. The handshake's pending read then fails (FCB fails pending ops on
+    /// didDisconnect), the attempt fails retryable, and the caller enters backoff —
+    /// the same path as a lost link. Cancelled by `attemptConnect`'s defer when the
+    /// handshake ends either way.
+    private func startHandshakeTimeout(radio: UUID, epoch myEpoch: UInt64, generation: UInt64) -> Task<Void, Never> {
+        let clock = self.clock
+        return Task { [weak self] in
+            do {
+                try await clock.sleep(for: Self.handshakeTimeout)
+            } catch {
+                return
+            }
+            await self?.handshakeTimedOut(radio: radio, epoch: myEpoch, generation: generation)
+        }
+    }
+
+    private func handshakeTimedOut(radio: UUID, epoch myEpoch: UInt64, generation: UInt64) async {
+        guard myEpoch == epoch, connectionState == .configuring, drainGeneration == generation else { return }
+        logger.error("want_config handshake timed out")
+        try? await central.disconnect(radio)
     }
 }

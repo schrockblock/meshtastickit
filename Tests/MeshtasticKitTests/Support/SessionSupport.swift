@@ -171,3 +171,43 @@ func makeSessionHarness(
     let session = MeshtasticSession(central: recording(radio.central, into: log), clock: clock, packetID: packetID)
     return SessionHarness(radio: radio, session: session, log: log)
 }
+
+// MARK: Clocks and gates
+
+/// Records every requested sleep and returns at once. `now` never advances, so a
+/// `sleep(for: d)` arrives as a deadline offset of exactly `d`.
+struct SleepRecordingClock: Clock {
+    struct Instant: InstantProtocol {
+        var offset: Duration
+        func advanced(by duration: Duration) -> Instant { Instant(offset: offset + duration) }
+        func duration(to other: Instant) -> Duration { other.offset - offset }
+        static func < (lhs: Instant, rhs: Instant) -> Bool { lhs.offset < rhs.offset }
+    }
+
+    let sleeps = LockIsolated<[Duration]>([])
+    var now: Instant { Instant(offset: .zero) }
+    var minimumResolution: Duration { .zero }
+
+    func sleep(until deadline: Instant, tolerance: Duration?) async throws {
+        try Task.checkCancellation()
+        sleeps.withValue { $0.append(deadline.offset) }
+        await Task.yield()
+    }
+}
+
+/// Suspends `wait()` callers until `open()`.
+actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        for waiter in waiters { waiter.resume() }
+        waiters = []
+    }
+}

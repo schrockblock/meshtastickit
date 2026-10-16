@@ -48,6 +48,13 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
         set { delegate.withState { $0.ackBehavior = newValue } }
     }
 
+    /// `false`: want_config is ignored, so the radio never sends config_complete
+    /// (exercises the session's handshake timeout).
+    public var answersWantConfig: Bool {
+        get { delegate.withState { $0.answersWantConfig } }
+        set { delegate.withState { $0.answersWantConfig = newValue } }
+    }
+
     /// Every decoded MeshPacket written to ToRadio, in arrival order.
     public var receivedPackets: [MeshPacket] { delegate.withState { $0.receivedPackets } }
 
@@ -165,6 +172,7 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             var queue: [Data] = []
             var modemPreset: Config.LoRaConfig.ModemPreset?
             var ackBehavior: AckBehavior = .ack
+            var answersWantConfig = true
             var receivedPackets: [MeshPacket] = []
         }
 
@@ -340,6 +348,7 @@ public final class MockMeshtasticDevice: @unchecked Sendable {
             }
             switch toRadio.payloadVariant {
             case .wantConfigID(let nonce)?:
+                guard withState({ $0.answersWantConfig }) else { break }
                 let preset = withState { $0.modemPreset }
                 var frames = [selfMyInfo(), selfNodeFrame()]
                 frames += MockMeshtasticDevice.nodeNums.indices.map { nodeFrame(index: $0) }
