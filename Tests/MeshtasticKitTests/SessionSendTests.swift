@@ -115,11 +115,12 @@ extension CBMBackedTests {
 
         /// Power-off while FCB's write is pending: CBM drops the write response
         /// (CBMCentralManagerMock.swift:1477-1478 only responds while `.connected`) and
-        /// FCB fails no pending op on a state change, so that send never returns.
+        /// FCB fails no pending op on a state change, so FCB never answers that write.
         /// The hook powers off INSIDE the write request, before the response is
-        /// scheduled — deterministic. The session must not let the leaked write hold
-        /// the write slot: the next link's want_config and a later send need it.
-        @Test func powerOffDuringASendFreesTheWriteSlotForTheNextLink() async {
+        /// scheduled — deterministic. The session must fail that send itself (its
+        /// caller must not hang) and must not let the leaked write hold the write
+        /// slot: the next link's want_config and a later send need it.
+        @Test func powerOffDuringASendFailsItAndFreesTheWriteSlotForTheNextLink() async {
             let h = await makeSessionHarness()
             h.radio.device.ackBehavior = .silent
             await h.session.connect(radio: h.radio.id)
@@ -129,15 +130,23 @@ extension CBMBackedTests {
                 if fire { CBMCentralManagerMock.simulatePowerOff() }
             }
             let off = h.session.events()
-            let stuckFinished = LockIsolated(false)
-            let stuck = Task { [session = h.session] in
-                _ = try? await session.send(MeshtasticOutbound(portnum: 76, payload: Data([1])))
-                stuckFinished.setValue(true)
+            // The in-flight send's outcome: "returned an id" or the error it threw.
+            // Unstructured + polling, so a hung send fails this test instead of hanging it.
+            let inFlight = LockIsolated<String?>(nil)
+            Task { [session = h.session] in
+                do {
+                    _ = try await session.send(MeshtasticOutbound(portnum: 76, payload: Data([1])))
+                    inFlight.setValue("returned an id")
+                } catch {
+                    inFlight.setValue("\(error)")
+                }
             }
             let (_, sawReconnecting) = await collect(off) { $0.connectionState == .reconnecting(attempt: 1) }
             #expect(sawReconnecting)
             #expect(h.radio.device.receivedPackets.count == 1)
-            #expect(!stuckFinished.value)   // the scenario: that write is still pending in FCB
+            let inFlightEnded = await waitUntil(timeout: .seconds(2)) { inFlight.value != nil }
+            #expect(inFlightEnded)
+            #expect(inFlight.value == "\(MeshtasticSessionError.notConnected)")
 
             let on = h.session.events()
             CBMCentralManagerMock.simulatePowerOn()
@@ -153,7 +162,6 @@ extension CBMBackedTests {
             let sent = await waitUntil(timeout: .seconds(5)) { nextID.value != nil }
             #expect(sent)
             #expect(h.radio.device.receivedPackets.count == 2)
-            stuck.cancel()
             await h.session.disconnect()
         }
     }

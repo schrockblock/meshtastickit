@@ -54,6 +54,12 @@ public actor MeshtasticSession {
     /// returns must not hold the slot for the next link; a stale writer that does
     /// return releases nothing.
     private var writeGeneration: UInt64 = 0
+    /// The write the slot holder is waiting on. Its completion is SESSION-owned:
+    /// FCB's result or teardown (`resetWriteSlot()` throws `notConnected`),
+    /// whichever comes first. A losing FCB write is abandoned: its late result
+    /// carries an old `writeSeq` and is ignored.
+    private var writeSeq: UInt64 = 0
+    private var inFlightWrite: (seq: UInt64, completion: CheckedContinuation<Void, any Error>)?
 
     public init(central: BluetoothCentralClient,
                 clock: any Clock<Duration> = ContinuousClock(),
@@ -339,7 +345,29 @@ public actor MeshtasticSession {
     private func writeToRadio(_ bytes: Data, radio: UUID) async throws {
         let generation = try await acquireWriteSlot()
         defer { releaseWriteSlot(generation) }
-        try await central.writeValue(bytes, radio, MeshGATT.toRadioUUID, .withResponse)
+        writeSeq &+= 1
+        let seq = writeSeq
+        let central = self.central
+        try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, any Error>) in
+            inFlightWrite = (seq, completion)
+            Task {   // actor-isolated: completes on the session
+                let result: Result<Void, any Error>
+                do {
+                    try await central.writeValue(bytes, radio, MeshGATT.toRadioUUID, .withResponse)
+                    result = .success(())
+                } catch {
+                    result = .failure(error)
+                }
+                self.finishWrite(seq, result)
+            }
+        }
+    }
+
+    /// FCB answered write `seq`. Ignored if teardown already failed it.
+    private func finishWrite(_ seq: UInt64, _ result: Result<Void, any Error>) {
+        guard let write = inFlightWrite, write.seq == seq else { return }
+        inFlightWrite = nil
+        write.completion.resume(with: result)
     }
 
     /// Returns the generation the slot was acquired in. A queued waiter is either
@@ -367,9 +395,13 @@ public actor MeshtasticSession {
         }
     }
 
-    /// Link teardown: abandon the in-flight write (FCB may never resume it), free
-    /// the slot, and fail every queued writer.
+    /// Link teardown: fail the in-flight write now (FCB may never resume it — its
+    /// caller must not hang), free the slot, and fail every queued writer.
     private func resetWriteSlot() {
+        if let write = inFlightWrite {
+            inFlightWrite = nil
+            write.completion.resume(throwing: MeshtasticSessionError.notConnected)
+        }
         writeGeneration &+= 1
         writeInFlight = false
         let waiters = writeWaiters

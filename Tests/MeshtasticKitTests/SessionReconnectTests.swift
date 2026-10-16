@@ -107,6 +107,48 @@ struct SessionBackoffTests {
         await session.disconnect()
     }
 
+    /// Attempt 1's want_config write is abandoned by the handshake timeout; attempt
+    /// 2's write is then in flight when attempt 1's FCB write finally fails. That
+    /// late result belongs to the abandoned write and must not fail attempt 2.
+    @Test func lateResultOfAnAbandonedWriteCannotCompleteTheCurrentOne() async {
+        let id = UUID()
+        let log = LockIsolated<[String]>([])
+        let clock = TestClock()
+        let firstWriteGate = AsyncGate()
+        let writes = LockIsolated(0)
+        var central = fakeCentral(radio: id, log: log, connect: {})
+        central.writeValue = { _, _, _, _ in
+            let n = writes.withValue { count -> Int in count += 1; return count }
+            if n == 1 {
+                await firstWriteGate.wait()
+                throw BluetoothError.operationCancelled
+            }
+            await AsyncGate().wait()   // every later write stays in flight
+        }
+        let session = MeshtasticSession(central: central, clock: clock)
+        let events = session.events()
+        Task { await session.connect(radio: id) }
+        let (_, configuring) = await collect(events) { $0 == .connection(.configuring) }
+        #expect(configuring)
+        try? await Task.sleep(for: .milliseconds(100))
+        let firstAbort = session.events()
+        await clock.advance(by: .seconds(30))   // attempt 1's handshake times out
+        let (_, backedOff) = await collect(firstAbort) { $0 == .connection(.reconnecting(attempt: 1)) }
+        #expect(backedOff)
+        try? await Task.sleep(for: .milliseconds(100))
+        let second = session.events()
+        await clock.advance(by: .seconds(1))    // backoff ends: attempt 2
+        let (_, secondConfiguring) = await collect(second) { $0 == .connection(.configuring) }
+        #expect(secondConfiguring)
+        let secondWriteIssued = await waitUntil(timeout: .seconds(2)) { writes.value == 2 }
+        #expect(secondWriteIssued)
+        let late = session.events()
+        await firstWriteGate.open()             // attempt 1's write fails, late
+        let (seen, _) = await collect(late, timeout: .milliseconds(500)) { _ in false }
+        #expect(seen == [.connection(.configuring)])
+        await session.disconnect()
+    }
+
     @Test func disconnectEndsAConnectStuckInItsHandshake() async {
         let id = UUID()
         let log = LockIsolated<[String]>([])
