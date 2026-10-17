@@ -114,8 +114,8 @@ extension CBMBackedTests {
         }
 
         /// Power-off while FCB's write is pending: CBM drops the write response
-        /// (CBMCentralManagerMock.swift:1477-1478 only responds while `.connected`) and
-        /// FCB fails no pending op on a state change, so FCB never answers that write.
+        /// (CBMCentralManagerMock.swift:1477-1478 only responds while `.connected`); FCB
+        /// now fails that write with `.poweredOff` (older FCB never answered it).
         /// The hook powers off INSIDE the write request, before the response is
         /// scheduled — deterministic. The session must fail that send itself (its
         /// caller must not hang) and must not let the leaked write hold the write

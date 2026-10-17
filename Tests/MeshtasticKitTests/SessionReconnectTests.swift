@@ -76,9 +76,9 @@ struct SessionBackoffTests {
     }
 
     /// A fake whose FromRadio read suspends until `gate` opens, ignoring
-    /// cancellation and disconnect — FCB's behaviour for a read pending at a
-    /// power-off (its disconnect of a `.disconnected` peripheral is a no-op). CBM
-    /// cannot hold a read of a CONNECTED peripheral open, hence the fake.
+    /// cancellation and disconnect — a dependency that never answers (older FCB
+    /// did this for a read pending at a power-off). CBM cannot hold a read of a
+    /// CONNECTED peripheral open, hence the fake.
     private func gatedReadCentral(radio: UUID, log: LockIsolated<[String]>, gate: AsyncGate,
                                   lateFrame: Data = Data()) -> BluetoothCentralClient {
         var central = fakeCentral(radio: radio, log: log, connect: {})
@@ -291,9 +291,8 @@ extension CBMBackedTests {
         }
 
         /// iOS (and CBM, CBMCentralManagerMock.swift:80-104) report a power-off as a
-        /// state change only — no didDisconnect. If this fails inside FCB (e.g. a
-        /// stale pending read/notify slot after power-off), STOP and report: do not
-        /// patch FCB in this lane.
+        /// state change only — no didDisconnect. FCB fails pending operations at
+        /// the power-off (lane F); the session must not depend on it.
         @Test func powerCycleWhileConnectedReconnectsAndReportsAdapter() async {
             let h = await makeSessionHarness()
             await h.session.connect(radio: h.radio.id)
@@ -332,14 +331,14 @@ extension CBMBackedTests {
             await connecting.value
         }
 
-        /// Power-off DURING the want_config handshake: no didDisconnect, FCB fails
-        /// no pending op, and a disconnect of the already-`.disconnected` peripheral
-        /// is a no-op — so the handshake's FromRadio read never resolves. The hook
+        /// Power-off DURING the want_config handshake: no didDisconnect. (Older FCB
+        /// failed no pending op, so the handshake's FromRadio read never resolved;
+        /// FCB now fails it with `.poweredOff` — the session copes either way.) The hook
         /// powers off INSIDE the first FromRadio read request (the radio ignores
         /// want_config, so the session is deterministically `.configuring` with that
         /// read pending). The session itself must fail the attempt, back off, and
         /// configure again once power returns. Real clock: 1 s + 2 s of backoff
-        /// (the first post-power-on handshake read hits FCB's stale pending read).
+        /// (older FCB's stale pending read cost one extra attempt; none now).
         @Test func powerOffDuringHandshakeFailsTheAttemptAndReconnects() async {
             let h = await makeSessionHarness()
             h.radio.device.answersWantConfig = false

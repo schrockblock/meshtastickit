@@ -35,8 +35,9 @@ public actor MeshtasticSession {
     private var attemptTask: Task<Void, any Error>?
     /// The attempt `runAttempt` is waiting on. Its outcome is SESSION-owned: the
     /// attempt task, the handshake timeout, the adapter leaving `.poweredOn`, or
-    /// teardown — whichever comes first — resolves it. FCB fails no pending op on a
-    /// power-off, so an attempt must never depend on FCB to end. An attempt that
+    /// teardown — whichever comes first — resolves it. FCB once failed no pending op
+    /// on a power-off (fixed in FCB, Meshtastic lane F); an attempt still never depends
+    /// on FCB to end. An attempt that
     /// lost the race is abandoned: its id no longer matches, so every `check` in it
     /// throws and it can never emit state or touch BLE again.
     private var attemptSeq: UInt64 = 0
@@ -49,13 +50,13 @@ public actor MeshtasticSession {
     private var reconnectTask: Task<Void, Never>?
     static let maxBackoff: Duration = .seconds(30)
     static let handshakeTimeout: Duration = .seconds(30)
-    /// FIFO slot for ToRadio writes: FCB holds one pending write per characteristic
-    /// and overwrites it, so two in-flight writes would leak the first.
+    /// FIFO slot for ToRadio writes: FCB holds one pending write per characteristic,
+    /// and a second write fails the first with `operationCancelled`.
     private var writeInFlight = false
     /// Each waiter is resumed with the generation the slot was handed over in.
     private var writeWaiters: [CheckedContinuation<UInt64, any Error>] = []
-    /// Bumped by `resetWriteSlot()` on every link teardown. FCB can leak a pending
-    /// write forever (a power-off fails no pending op), so a writer that never
+    /// Bumped by `resetWriteSlot()` on every link teardown. Older FCB leaked a pending
+    /// write forever at a power-off; the slot still never waits on FCB, so a writer that never
     /// returns must not hold the slot for the next link; a stale writer that does
     /// return releases nothing.
     private var writeGeneration: UInt64 = 0
@@ -179,7 +180,7 @@ public actor MeshtasticSession {
     /// The handshake got no config_complete within `handshakeTimeout`.
     private struct HandshakeTimedOut: Error {}
     /// The adapter left `.poweredOn` mid-attempt (iOS reports a power-off as a
-    /// state change only, and FCB fails no pending op on it).
+    /// state change only; the session ends the attempt itself instead of waiting on FCB).
     private struct AdapterLeftPoweredOn: Error {}
 
     /// Runs one attempt in its own task, so `disconnect()` can cancel the parts
@@ -613,9 +614,9 @@ public actor MeshtasticSession {
     /// No config_complete within `handshakeTimeout` on the injected clock → the
     /// session fails the attempt itself (retryably), abandoning the handshake's
     /// pending FCB read; `runAttempt`'s failure path then drops the BLE link and
-    /// the caller enters backoff — the same path as a lost link. It must not wait
-    /// for FCB: after a power-off FCB's disconnect is a no-op and nothing fails the
-    /// read. Cancelled by `attemptConnect`'s defer when the handshake ends.
+    /// the caller enters backoff — the same path as a lost link. It does not wait
+    /// for FCB to fail the read (older FCB never did after a power-off).
+    /// Cancelled by `attemptConnect`'s defer when the handshake ends.
     private func startHandshakeTimeout(epoch myEpoch: UInt64, attempt: UInt64) -> Task<Void, Never> {
         let clock = self.clock
         return Task { [weak self] in

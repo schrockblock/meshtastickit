@@ -87,6 +87,47 @@ extension CBMBackedTests {
             #expect(found?.name == "Meshtastic_MOCK")
         }
 
+        /// FCB runs one radio scan per central: a newer scan by another owner
+        /// supersedes this one, and the scanner's stream finishes (for good)
+        /// instead of silently going quiet. Live FCB client against CBM.
+        @Test func aNewerScanByAnotherOwnerEndsTheScannerStream() async {
+            let radio = await makeMockRadio()
+            let found = LockIsolated(0)
+            let ended = LockIsolated(false)
+            let consumer = Task {
+                for await _ in MeshtasticScanner.scan(central: radio.central) { found.withValue { $0 += 1 } }
+                ended.setValue(true)
+            }
+            #expect(await waitUntil { found.value > 0 })
+            let other = Task { for await _ in radio.central.scan([CBUUID]?.none, ScanOptions?.none) {} }
+            let finished = await waitUntil(timeout: .seconds(2)) { ended.value }
+            #expect(finished, "the superseded scanner stream must finish, not go quiet")
+            other.cancel()
+            consumer.cancel()
+        }
+
+        /// Bluetooth power-cycled mid-scan: CoreBluetooth stops the radio scan and
+        /// never resumes it, and FCB ends the scan stream. The scanner waits for
+        /// power and scans again; its stream does not finish. Live FCB client against CBM.
+        @Test func scannerScansAgainAfterAPowerCycle() async {
+            let radio = await makeMockRadio()
+            let found = LockIsolated(0)
+            let ended = LockIsolated(false)
+            let consumer = Task {
+                for await _ in MeshtasticScanner.scan(central: radio.central) { found.withValue { $0 += 1 } }
+                ended.setValue(true)
+            }
+            #expect(await waitUntil { found.value > 0 })
+            CBMCentralManagerMock.simulatePowerOff()
+            try? await Task.sleep(for: .milliseconds(200))
+            let beforePowerOn = found.value
+            CBMCentralManagerMock.simulatePowerOn()
+            let rescanned = await waitUntil(timeout: .seconds(5)) { found.value > beforePowerOn }
+            #expect(rescanned, "the scanner must scan again once Bluetooth is back on")
+            #expect(!ended.value)
+            consumer.cancel()
+        }
+
         /// A radio that advertises only the service UUID (no local name) is named
         /// from its peripheral name. Live FCB client against CBM.
         @Test func nameFallsBackToThePeripheralNameWhenNotAdvertised() async {
