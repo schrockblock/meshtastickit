@@ -107,10 +107,11 @@ public actor MeshtasticSession {
         case .connected, .superseded:
             return
         case .terminal(let reason):
+            logger.error("connect attempt failed for good: \(reason, privacy: .public)")
             radioID = nil
             setState(.disconnected(reason: reason))
         case .retryable(let reason):
-            logger.error("connect attempt failed: \(reason)")
+            logger.error("connect attempt failed: \(reason, privacy: .public)")
             scheduleReconnect(radio: radio, epoch: myEpoch)
         }
     }
@@ -286,18 +287,26 @@ public actor MeshtasticSession {
         guard known.contains(where: { $0.id == radio }) else {
             throw TerminalFailure(reason: "radio not found")
         }
+        // One notice per step, so a device log shows which step an attempt stalls in
+        // (connect has no timeout of its own: it waits for an out-of-range radio).
+        logger.notice("attempt \(attempt): connecting")
         _ = try await central.connect(radio, ConnectOptions?.none)
         try check(myEpoch, attempt: attempt)
+        logger.notice("attempt \(attempt): connected, discovering services")
         _ = try await central.discoverServices(radio, [MeshGATT.serviceUUID])
         try check(myEpoch, attempt: attempt)
+        logger.notice("attempt \(attempt): discovering characteristics")
         _ = try await central.discoverCharacteristics(
             radio, MeshGATT.serviceUUID,
             [MeshGATT.toRadioUUID, MeshGATT.fromRadioUUID, MeshGATT.fromNumUUID]
         )
         try check(myEpoch, attempt: attempt)
-        // Subscribe to FromNum BEFORE want_config so no notify is lost.
+        // Subscribe to FromNum BEFORE want_config so no notify is lost. FromNum is
+        // encrypted, so this is where iOS pairs (the radio shows its PIN).
+        logger.notice("attempt \(attempt): subscribing to FromNum")
         try await central.setNotify(true, radio, MeshGATT.fromNumUUID)
         try check(myEpoch, attempt: attempt)
+        logger.notice("attempt \(attempt): subscribed, requesting config")
         startFromNumLoop(radio: radio, epoch: myEpoch)
 
         isDraining = true
@@ -315,6 +324,7 @@ public actor MeshtasticSession {
             throw error
         }
         isDraining = false
+        logger.notice("attempt \(attempt): configured")
         setState(.connected)
         emit(.configured(myNodeNum: myNodeNum ?? 0, modemPreset: modemPreset))
         startDisconnectWatch(radio: radio, epoch: myEpoch, events: linkEvents)
@@ -468,7 +478,7 @@ public actor MeshtasticSession {
     }
 
     private func logDrainEnd(_ error: any Error) {
-        logger.error("FromNum notification stream ended: \(String(describing: error))")
+        logger.error("FromNum notification stream ended: \(String(describing: error), privacy: .public)")
     }
 
     /// Drains FromRadio until an empty read. A stale drain (older epoch, or one
@@ -492,7 +502,7 @@ public actor MeshtasticSession {
             do {
                 data = try await central.readValue(radio, MeshGATT.fromRadioUUID)
             } catch {
-                logger.error("FromRadio read failed during drain: \(String(describing: error))")
+                logger.error("FromRadio read failed during drain: \(String(describing: error), privacy: .public)")
                 return
             }
             guard myEpoch == epoch, drainGeneration == claimed else { return }
@@ -599,11 +609,12 @@ public actor MeshtasticSession {
             case .connected, .superseded:
                 return
             case .terminal(let reason):
+                logger.error("reconnect attempt \(attempt) failed for good: \(reason, privacy: .public)")
                 radioID = nil
                 setState(.disconnected(reason: reason))
                 return
             case .retryable(let reason):
-                logger.error("reconnect attempt \(attempt) failed: \(reason)")
+                logger.error("reconnect attempt \(attempt) failed: \(reason, privacy: .public)")
                 delay = min(delay * 2, Self.maxBackoff)
                 attempt += 1
                 setState(.reconnecting(attempt: attempt))
